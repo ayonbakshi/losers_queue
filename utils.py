@@ -22,11 +22,17 @@ def kda_str(kills, deaths, assists):
     
     return kda
 
-def get_leaderboard(elos_dict, names=None):
+def get_leaderboard(elos_dict, names=None, key=None):
     if names is None:
         names = elos_dict.keys()
         
+    # populate missing names with default value
     for name in names:
         elos_dict[name]
-    elos = sorted(elos_dict.items(), key=lambda x: x[1], reverse=True)
+
+    # identity
+    if not key:
+        key = lambda x: x
+
+    elos = sorted(elos_dict.items(), key=lambda x: key(x[1]), reverse=True)
     return elos

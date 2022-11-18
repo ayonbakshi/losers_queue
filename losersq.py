@@ -3,11 +3,13 @@ from collections import defaultdict
 import copy
 import os
 from attr import dataclass
-from datetime import timedelta, datetime
+from datetime import datetime
 import pytz
-from typing import Optional
+from typing import Any, Optional
 
 from utils import CHAMP_ID_TO_NAME, kda_str, get_leaderboard
+
+import trueskill
 
 class Participant:
     
@@ -44,9 +46,6 @@ class Team:
         self.tower_kills = team_dict['towerKills']
         self.inhibitor_kills = team_dict['inhibitorKills']
 
-
-
-
 class Match:
     
     def __init__(self, match_file):
@@ -76,26 +75,10 @@ class Match:
         teams.sort(key=lambda t: t.win)
         self.losing_team, self.winning_team = teams
 
-        self._elos_before, self._elos_after = None, None
-        self._ranks_before, self._ranks_after = None, None
-
-    def set_elos(self, elos_before, elos_after):
-        self._elos_before = elos_before
-        self._elos_after = elos_after
-
-        leaderboard_before = get_leaderboard(self._elos_before, names=self._elos_after.keys())
-        leaderboard_after = get_leaderboard(self._elos_after)
-        self._ranks_before = {name : i for i, (name, _) in enumerate(leaderboard_before, 1)}
-        self._ranks_after = {name : i for i, (name, _) in enumerate(leaderboard_after, 1)}
-
-
-    def _team_stats_str(self, name, t: Team):
-        avg_elo_before = sum(self._elos_before[name] for name in t.team_members) / len(t.team_members)
-        avg_elo_after = sum(self._elos_after[name] for name in t.team_members) / len(t.team_members)
-
+    def _team_stats_str(self, name, t: Team, team_rating_before, team_rating_after):
         return '--'.join([
             f'{name}',
-            f'(Rating {round(avg_elo_before)} -> {round(avg_elo_after)})',
+            f'(Rating {team_rating_before} -> {team_rating_after})',
             f'({t.tower_kills} T)',
             f'({t.inhibitor_kills} I)',
             f'({t.dragon_kills} D)',
@@ -105,10 +88,8 @@ class Match:
         ])
             
 
-    def _participant_stats_str(self, name, p: Participant):
+    def _participant_stats_str(self, name, p: Participant, rating_before, rating_after, rank_before, rank_after):
         kda = kda_str(p.kills, p.deaths, p.assists)
-        elo_before, elo_after = self._elos_before[name], self._elos_after[name]
-        rank_before, rank_after = self._ranks_before[name], self._ranks_after[name]
 
         return ''.join([
             f'{name}'.ljust(15),
@@ -116,7 +97,7 @@ class Match:
             f'{p.kills}/{p.deaths}/{p.assists} ({kda})'.ljust(20),
             f'Damage {p.dmg_to_champs}'.ljust(14),
             f'CS {p.cs} ({p.cs/(self.match_duration/60):.1f}/m)'.ljust(16),
-            f'Rating {round(elo_before)} [{rank_before:02}] -> {round(elo_after)} [{rank_after:02}]',
+            f'Rating {rating_before} [{rank_before:02}] -> {rating_after} [{rank_after:02}]',
         ])
 
     def _match_stats_str(self):
@@ -126,19 +107,30 @@ class Match:
             f'{creation.date()}-{creation.time().strftime("%H:%M:%S")}',
             f"{m}m{s:02}s"
         ])
-
-
-    def __str__(self):
-        if self._elos_before is None and self._elos_after is None:
-            self.set_elos(defaultdict(lambda: 'N/A'), defaultdict(lambda: 'N/A'))
+    
+    def as_str(self, ratings_before, ratings_after, team_rating_f) -> str:
+        leaderboard_before = get_leaderboard(ratings_before, names=ratings_after.keys())
+        leaderboard_after = get_leaderboard(ratings_after)
+        ranks_before = {name : i for i, (name, _) in enumerate(leaderboard_before, 1)}
+        ranks_after = {name : i for i, (name, _) in enumerate(leaderboard_after, 1)}
 
         winner_strs, loser_strs = [], []
         for name, p in self.participants.items():
             team = winner_strs if p.win else loser_strs
-            team.append(self._participant_stats_str(name, p))
+            team.append(self._participant_stats_str(
+                name, p,
+                ratings_before[name], ratings_after[name],
+                ranks_before[name], ranks_after[name]))
 
-        w_team_str = self._team_stats_str('WINNERS', self.winning_team)
-        l_team_str = self._team_stats_str('LOSERS', self.losing_team)
+        w_team_str = self._team_stats_str(
+            'WINNERS', self.winning_team,
+            team_rating_f([ratings_before[name] for name in self.winning_team.team_members]),
+            team_rating_f([ratings_after[name] for name in self.winning_team.team_members]))
+
+        l_team_str = self._team_stats_str(
+            'LOSERS', self.losing_team,
+            team_rating_f([ratings_before[name] for name in self.losing_team.team_members]),
+            team_rating_f([ratings_after[name] for name in self.losing_team.team_members]))
 
         match_str = self._match_stats_str()
 
@@ -155,34 +147,118 @@ class Match:
             match_str.rjust(width, '=')
         ])
 
-class EloSystem:
-
+class RatingSystem:
     @dataclass
     class Player:
         name: str
-        elo: int
         champ: Optional[str] = None
 
-    def __init__(self, k=32):
+    def get_default(self):
+        raise NotImplementedError
+    
+    # for sorting leaderboard
+    def rating_key(self, rating):
+        return rating
+
+    # for aggragating ratings into a singular rating
+    def team_rating(self, ratings):
+        return sum(ratings) / len(ratings)
+
+    def get_new_ratings(self, winners: list[Player], losers: list[Player], ratings: dict[str, Any]):
+        raise NotImplementedError
+
+class EloSystem(RatingSystem):
+
+    class Elo(float):
+        def __new__(self, value):
+            return float.__new__(self, value)
+
+        def __init__(self, value):
+            float.__init__(value)
+
+        def __str__(self):
+            return f'{round(self)}'
+    
+
+    def __init__(self, start_elo=1500, k=32):
+        self._start_elo = start_elo
         self._k = k
 
-    def update_elos(self, winners, losers) -> list[Player]:
-        winners = copy.deepcopy(winners)
-        losers = copy.deepcopy(losers)
+    def get_default(self):
+        return EloSystem.Elo(self._start_elo)
 
-        R_winner = sum(player.elo for player in winners) / len(winners)
-        R_loser = sum(player.elo for player in losers) / len(losers)
+    def team_rating(self, ratings):
+        return EloSystem.Elo(super().team_rating(ratings))
+
+    def get_new_ratings(self,
+                        winners: list[RatingSystem.Player],
+                        losers: list[RatingSystem.Player],
+                        ratings: dict[str, float]) -> dict[str, float]:
+
+        new_ratings = copy.deepcopy(ratings)
+        
+        R_winner = sum(ratings[player.name] for player in winners) / len(winners)
+        R_loser = sum(ratings[player.name] for player in losers) / len(losers)
         R_delta = R_loser - R_winner
         winner_delta = 1 - 1 / (1 + 10**(R_delta/400))
-
-        
         
         for player in winners:
-            player.elo += self._k * winner_delta
+            new_elo = EloSystem.Elo(new_ratings[player.name] + self._k * winner_delta)
+            new_ratings[player.name] = new_elo
         for player in losers:
-            player.elo -= self._k * winner_delta
+            new_elo = EloSystem.Elo(new_ratings[player.name] - self._k * winner_delta)
+            new_ratings[player.name] = new_elo
         
-        return winners + losers
+        return new_ratings
+
+class TrueSkill(RatingSystem):
+
+    class Rating(trueskill.Rating):
+
+        def __init__(self, mu=None, sigma=None):
+            super().__init__(mu, sigma)
+
+        def __str__(self):
+            return f'{round(self.mu):04}±{round(self.sigma):04}'
+    
+
+    def __init__(self, mu=1500, sigma=500, beta=None, tau=None):
+        if beta is None:
+            beta = sigma / 2
+        if tau is None:
+            tau = sigma / 100
+        
+        trueskill.setup(mu=mu, sigma=sigma, beta=beta, tau=tau, draw_probability=0)
+
+
+    def get_default(self):
+        return TrueSkill.Rating()
+
+    def rating_key(self, rating: 'TrueSkill.Rating'):
+        return (rating.mu, -rating.sigma)
+
+    def team_rating(self, ratings):
+        total_mu = sum(r.mu for r in ratings) / len(ratings)
+        total_sigma = sum(r.sigma for r in ratings) / len(ratings)
+        return TrueSkill.Rating(mu=total_mu, sigma=total_sigma)
+
+    def get_new_ratings(self,
+                        winners: list[RatingSystem.Player],
+                        losers: list[RatingSystem.Player],
+                        ratings: dict[str, 'TrueSkill.Rating']) -> dict[str, 'TrueSkill.Rating']:
+
+        R_winners = {p.name: ratings[p.name] for p in winners}
+        R_losers = {p.name: ratings[p.name] for p in losers}
+
+        updated_ratings = \
+            trueskill.rate([R_winners, R_losers], ranks=[0, 1])
+
+        new_ratings = copy.deepcopy(ratings)
+        for team in updated_ratings:
+            for name, rating in team.items():
+                new_ratings[name] = TrueSkill.Rating(rating.mu, rating.sigma)
+
+        return new_ratings
 
 class PlayerStats:
 
@@ -227,10 +303,7 @@ class PlayerStats:
             multikills = tuple(x + y for x,y in zip(multikills, p.multikills))
         return multikills
 
-    def get_elo(self):
-        return self._matches[0]._elos_after[self.name]
-
-    def get_leaderboard_str(self, champ=None):
+    def get_leaderboard_str(self, rating, champ=None):
         win, loss = self.get_win_loss(champ=champ)
         
         k, d, a = self.get_avg_kda(champ=champ)
@@ -238,11 +311,9 @@ class PlayerStats:
 
         doubles, triples, quadras, pentas = self.get_multikills(champ=champ)
 
-        elo = self.get_elo()
-
         return ' | '.join([
             f'{self.name}'.ljust(15),
-            f'Rating {round(elo)}'.ljust(10),
+            f'Rating {rating}'.ljust(10),
             f'W/L {win}/{loss} [{win+loss}]'.ljust(15),
             f'KDA {k:.1f}/{d:.1f}/{a:.1f} ({kda})'.ljust(25),
             f'(D: {doubles}, T: {triples}, Q: {quadras}, P: {pentas})'.ljust(15)
@@ -252,7 +323,7 @@ class PlayerStats:
 
 class LosersQueue:
 
-    def __init__(self, match_files, start_elo=1500, alias_file=None):
+    def __init__(self, match_files, alias_file=None):
 
         matches = {}
 
@@ -269,36 +340,34 @@ class LosersQueue:
 
         self._matches.sort(key=lambda m: m.creation_time, reverse=True)
 
-        self._elo_system = EloSystem()
-        start_elos = defaultdict(lambda: start_elo)
-        self._elo_history = self.calculate_elo_history(
-            start_elos=start_elos, matches=self._matches, elo_system=self._elo_system)
+        self._rating_system = TrueSkill()
+        start_ratings = defaultdict(self._rating_system.get_default)
+        self._rating_history = self.calculate_rating_history(
+            start_ratings=start_ratings, matches=self._matches, rating_system=self._rating_system)
         
-        self._player_stats = {name : PlayerStats(name=name, matches=self._matches) for name in self._elo_history[-1]}
+        self._player_stats = {name : PlayerStats(name=name, matches=self._matches) for name in self._rating_history[0]}
 
-    def calculate_elo_history(self, start_elos, matches: list[Match], elo_system: EloSystem):
+    def calculate_rating_history(self, start_ratings, matches: list[Match], rating_system: RatingSystem):
         '''
-        elo_history[i] is elo before ith game
-        note that this mean len(elo_history) == len(matches) + 1
+        on return, rating_history[i] is rating after ith game
+        note that this mean len(rating_history) == len(matches) + 1
         '''
-        elo_history = [start_elos]
+        rating_history = [start_ratings]
         for match in reversed(matches):
-            elos = copy.deepcopy(elo_history[-1])
             winners, losers = [], []
             for name, p in match.participants.items():
                 team = winners if p.win else losers
-                team.append(EloSystem.Player(name=name, elo=elos[name], champ=p.champ))
+                team.append(RatingSystem.Player(name=name, champ=p.champ))
 
-            for player in elo_system.update_elos(winners, losers):
-                elos[player.name] = player.elo
-            
-            elo_history.append(elos)
-            match.set_elos(elos_before=elo_history[-2], elos_after=elo_history[-1])
+            new_ratings = self._rating_system.get_new_ratings(winners=winners, losers=losers, ratings=rating_history[-1])
+            rating_history.append(new_ratings)
 
-        return elo_history
+        rating_history.reverse()
+        return rating_history
 
-    def print_stats(self, name, champ):
-        stat_str = self._player_stats[name].get_leaderboard_str(champ=champ)
+    def print_stats(self, name, champ=None):
+        ratings = self._rating_history[0]
+        stat_str = self._player_stats[name].get_leaderboard_str(ratings[name], champ=champ)
 
         print('\n'.join([
             '=' * len(stat_str),
@@ -307,13 +376,12 @@ class LosersQueue:
         ]))
 
     def leaderboard(self):
-        latest_elos = self._elo_history[-1]
-        elos = get_leaderboard(latest_elos)
+        ratings = get_leaderboard(self._rating_history[0])
 
         stat_strs = []
-        for name, _ in elos:
+        for name, rating in ratings:
             stats = self._player_stats[name]
-            stat_strs.append(stats.get_leaderboard_str())
+            stat_strs.append(stats.get_leaderboard_str(rating))
 
         width = max(len(stat_str) for stat_str in stat_strs)
         print('\n'.join([
@@ -325,8 +393,9 @@ class LosersQueue:
     
     def print_matches(self, name=None, champ=None, n=3):
         matches = self._player_stats[name]._matches_with_champ(champ) if name is not None else self._matches
-        for match in matches[:n]:
-            print(match)
+        for match, (ratings_before, ratings_after) \
+            in zip(matches[:n], zip(self._rating_history[1:], self._rating_history)):
+            print(match.as_str(ratings_before, ratings_after, self._rating_system.team_rating))
     
 
 
